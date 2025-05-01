@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 import threading
 import tempfile
 import hashlib
+import bs4
+
 
 load_dotenv()
 
@@ -63,33 +65,54 @@ def generate_map_image(lat: float, lon: float, quake_id: str) -> str | None:
         logging.error(f"Map generation error for {quake_id}: {e}")
         return None
 
+def deactivate_user(chat_id: int):
+    try:
+        supabase.table("users").update({"active": False}).eq("chat_id", chat_id).execute()
+        logging.info(f"Kullanıcı {chat_id} sohbeti silmiş veya botu engellemiş. Pasif yapıldı.")
+    except Exception as e:
+        logging.error(f"Kullanıcı {chat_id} pasifleştirme hatası: {e}")
+
 def send_telegram_message(chat_id: int, text: str) -> bool:
     try:
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'},
             timeout=5
-        ).raise_for_status()
+        )
+        resp.raise_for_status()
         logging.info(f"Text message sent to {chat_id}")
         return True
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code in (403, 400):
+            deactivate_user(chat_id)
+        logging.error(f"Telegram send error (text) to {chat_id}: {e}")
+        return False
     except Exception as e:
         logging.error(f"Telegram send error (text) to {chat_id}: {e}")
         return False
 
+
 def send_telegram_photo(chat_id: int, image_path: str) -> bool:
     try:
         with open(image_path, 'rb') as img:
-            requests.post(
+            resp = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
                 data={'chat_id': chat_id},
                 files={'photo': img},
                 timeout=5
-            ).raise_for_status()
+            )
+            resp.raise_for_status()
         logging.info(f"Photo sent to {chat_id}")
         return True
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code in (403, 400):
+            deactivate_user(chat_id)
+        logging.error(f"Telegram send error (photo) to {chat_id}: {e}")
+        return False
     except Exception as e:
         logging.error(f"Telegram send error (photo) to {chat_id}: {e}")
         return False
+
 
 def get_user_threshold(chat_id: int) -> float:
     try:
@@ -126,13 +149,59 @@ def get_afad_data() -> list[dict]:
                     "longitude": float(ev["longitude"]),
                     "city": extract_city(ev.get("location", "")),
                     "notified": False,
-                    "created_at": now.isoformat()
+                    "created_at": now.isoformat(),
+                    "source": "AFAD"
                 })
         logging.info(f"Fetched {len(quakes)} quakes from AFAD")
         return quakes
     except Exception as e:
         logging.error(f"AFAD fetch error: {e}")
         return []
+
+def get_kandilli_data() -> list[dict]:
+    try:
+        url = "http://www.koeri.boun.edu.tr/scripts/lst9.asp"
+        response = requests.get(url, timeout=10)
+        soup = bs4.BeautifulSoup(response.content, "html.parser")
+        raw_text = soup.find_all("pre")[0].text
+
+        lines = raw_text.strip().split("\n")
+        clean_lines = [
+            line for line in lines
+            if line.strip() and not any(keyword in line.lower() for keyword in ["tarih", "--------", "analiz", "son 500"])
+        ]
+
+        quakes = []
+        for line in clean_lines:
+            try:
+                parts = line.split()
+                date_str, time_str = parts[0], parts[1]
+                lat, lon = float(parts[2]), float(parts[3])
+                magnitude = float(parts[6]) if parts[6].replace('.', '', 1).isdigit() else 0.0
+                city = " ".join(parts[8:-1])
+                date_time = datetime.strptime(date_str + " " + time_str, "%Y.%m.%d %H:%M:%S").replace(tzinfo=TURKEY_TZ).astimezone(timezone.utc)
+
+                quake = {
+                    "earthquake_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{date_time}_{lat}_{lon}_{magnitude}_K")),
+                    "date": date_time.isoformat(),
+                    "latitude": lat,
+                    "longitude": lon,
+                    "magnitude": magnitude,
+                    "city": city.strip().upper(),
+                    "notified": False,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "KANDILLI"
+                }
+                quakes.append(quake)
+            except Exception as e:
+                continue
+
+        logging.info(f"Fetched {len(quakes)} quakes from Kandilli")
+        return quakes
+    except Exception as e:
+        logging.error(f"Kandilli fetch error: {e}")
+        return []
+
 
 def upsert_quakes(quakes: list[dict]):
     if not quakes:
@@ -152,7 +221,7 @@ def upsert_quakes(quakes: list[dict]):
 
 def get_latest_notified_quake_info() -> tuple[dict | None, str | None]:
     try:
-        latest_notified = supabase.table('earthquakes').select('earthquake_id, date, magnitude, latitude, longitude').eq('notified', True).order('date', desc=True).limit(1).execute().data or []
+        latest_notified = supabase.table('earthquakes').select('earthquake_id, date, magnitude, latitude, longitude,source').eq('notified', True).order('date', desc=True).limit(1).execute().data or []
         if latest_notified:
             quake_info = latest_notified[0]
             quake_hash = generate_quake_hash(quake_info)
@@ -168,7 +237,7 @@ def notify_new():
     try:
         last_notified_info, last_notified_hash = get_latest_notified_quake_info()
         
-        query = supabase.table('earthquakes').select('earthquake_id,date,magnitude,city,latitude,longitude').eq('notified', False).order('date', desc=True).limit(1)
+        query = supabase.table('earthquakes').select('earthquake_id,date,magnitude,city,latitude,longitude,source').eq('notified', False).order('date', desc=True).limit(1)
         if last_notified_info:
             query = query.gt('date', last_notified_info['date'])
             
@@ -201,7 +270,14 @@ def notify_new():
             if quake_magnitude >= float(usr['threshold']):
                 if not img_path:
                     img_path = generate_map_image(quake['latitude'], quake['longitude'], quake_id)
-                text = f"⚠️ Yeni Deprem!\nTarih: {quake_time.strftime('%d.%m.%Y %H:%M')}\nBüyüklük: M{quake_magnitude:.1f}\nKonum: {quake['city'] or 'Bilinmiyor'}"
+                source = quake.get("source", "Bilinmiyor")
+                text = (
+                    f"⚠️ Yeni Deprem!\n"
+                    f"Tarih: {quake_time.strftime('%d.%m.%Y %H:%M')}\n"
+                    f"Büyüklük: M{quake_magnitude:.1f}\n"
+                    f"Konum: {quake['city'] or 'Bilinmiyor'}\n"
+                    f"Kaynak: {source}"
+                )
                 send_success = send_telegram_message(usr['chat_id'], text)
                 if send_success and img_path:
                     send_telegram_photo(usr['chat_id'], img_path)
@@ -224,7 +300,7 @@ def notify_new():
         logging.error(f"Notification error: {e}")
 
 def get_quakes(threshold: float=None, limit: int=1, last_24h: bool=False, biggest: bool=False) -> list[dict]:
-    q = supabase.table('earthquakes').select('earthquake_id,date,magnitude,city,latitude,longitude')
+    q = supabase.table('earthquakes').select('earthquake_id,date,magnitude,city,latitude,longitude,source')
     if threshold is not None:
         q = q.gte('magnitude', threshold)
     if last_24h:
@@ -251,9 +327,21 @@ def handle_telegram_updates():
                     continue
 
                 if text == "/start":
-                    supabase.table('users').upsert({"chat_id": chat_id, "active": True, "threshold": 3.0}).execute()
-                    send_telegram_message(chat_id, "Deprem bildirimlerine abone oldunuz! Varsayılan eşik: M3.0\nEşiği değiştirmek için: /deprem <sınır>")
-                    logging.info(f"New subscriber: {chat_id}")
+                    try:
+                        existing = supabase.table('users').select('threshold').eq('chat_id', chat_id).execute()
+
+                        if existing.data:
+                            supabase.table('users').update({"active": True}).eq("chat_id", chat_id).execute()
+                            send_telegram_message(chat_id, "🔔 Deprem bildirimlerine yeniden abone oldunuz!")
+                            logging.info(f"Kullanıcı yeniden aktif oldu: {chat_id}")
+                        else:
+                            supabase.table('users').insert({"chat_id": chat_id, "active": True, "threshold": 3.0}).execute()
+                            send_telegram_message(chat_id, "✅ Deprem bildirimlerine abone oldunuz!\nVarsayılan eşik: M3.0\nEşiği değiştirmek için: /deprem <sınır>")
+                            logging.info(f"Yeni abone eklendi: {chat_id}")
+                    except Exception as e:
+                        logging.error(f"/start komutu hatası: {e}")
+                        send_telegram_message(chat_id, "⚠️ Abonelik işlemi sırasında bir hata oluştu. Lütfen tekrar deneyin.")
+
 
                 elif text == "/stop":
                     supabase.table('users').update({"active": False}).eq("chat_id", chat_id).execute()
@@ -280,7 +368,14 @@ def handle_telegram_updates():
                     if latest:
                         q = latest[0]
                         qt = datetime.fromisoformat(q['date']).astimezone(TURKEY_TZ)
-                        msg = f"⚠️ Son Deprem!\nTarih: {qt.strftime('%d.%m.%Y %H:%M')}\nBüyüklük: M{q['magnitude']:.1f}\nKonum: {q['city'] or 'Bilinmiyor'}"
+                        source = q.get('source', 'Bilinmiyor')
+                        msg = (
+                            f"⚠️ Son Deprem!\n"
+                            f"Tarih: {qt.strftime('%d.%m.%Y %H:%M')}\n"
+                            f"Büyüklük: M{q['magnitude']:.1f}\n"
+                            f"Konum: {q['city'] or 'Bilinmiyor'}\n"
+                            f"Kaynak: {source}"
+                        )
                         send_telegram_message(chat_id, msg)
                         img = generate_map_image(q['latitude'], q['longitude'], q['earthquake_id'])
                         if img:
@@ -297,7 +392,13 @@ def handle_telegram_updates():
                         msg = f"⚠️ Son 5 Deprem (Eşik: M{th:.1f}):\n\n"
                         for i, q in enumerate(last5, 1):
                             qt = datetime.fromisoformat(q['date']).astimezone(TURKEY_TZ)
-                            msg += f"{i}. Tarih: {qt.strftime('%d.%m.%Y %H:%M')}\n   Büyüklük: M{q['magnitude']:.1f}\n   Konum: {q['city'] or 'Bilinmiyor'}\n\n"
+                            msg += (
+                            f"{i}. Tarih     : {qt.strftime('%d.%m.%Y %H:%M')}\n"
+                            f"   Büyüklük  : M{q['magnitude']:.1f}\n"
+                            f"   Konum     : {q['city'].strip() if q['city'] else 'Bilinmiyor'}\n"
+                            f"   Kaynak    : {q['source']}\n\n"
+                        )
+
                         send_telegram_message(chat_id, msg.strip())
                     else:
                         send_telegram_message(chat_id, f"M{th:.1f} üzeri son 5 deprem bulunamadı")
@@ -308,7 +409,13 @@ def handle_telegram_updates():
                     if big:
                         q = big[0]
                         qt = datetime.fromisoformat(q['date']).astimezone(TURKEY_TZ)
-                        msg = f"⚠️ Son 24 Saatin En Büyük Depremi (Eşik: M{th:.1f})!\nTarih: {qt.strftime('%d.%m.%Y %H:%M')}\nBüyüklük: M{q['magnitude']:.1f}\nKonum: {q['city'] or 'Bilinmiyor'}"
+                        msg = (
+                        f"⚠️ Son 24 Saatin En Büyük Depremi (Eşik: M{th:.1f})!\n"
+                        f"Tarih: {qt.strftime('%d.%m.%Y %H:%M')}\n"
+                        f"Büyüklük: M{q['magnitude']:.1f}\n"
+                        f"Konum: {q['city'] or 'Bilinmiyor'}\n"
+                        f"Kaynak: {q.get('source', 'Bilinmiyor')}"
+                        )
                         send_telegram_message(chat_id, msg)
                         img = generate_map_image(q['latitude'], q['longitude'], q['earthquake_id'])
                         if img:
@@ -332,8 +439,10 @@ def main_loop():
     logging.info("Telegram handler started")
     while True:
         logging.info("Main loop iteration: fetching & notifying")
-        quakes = get_afad_data()
-        upsert_quakes(quakes)
+        quakes_afad = get_afad_data()
+        quakes_kandilli = get_kandilli_data()
+        all_quakes = quakes_afad + quakes_kandilli
+        upsert_quakes(all_quakes)
         notify_new()
         time.sleep(20)
 
