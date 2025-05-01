@@ -75,7 +75,7 @@ Bot başlatıldığında:
 
 Botu test etmek için Telegram üzerinden erişebilirsiniz:
 
-👉 [@FinansciBot](https://t.me/FinansciBot)
+👉 [@FinansciBot](https://t.me/DepremciBot)
 
 ---
 
