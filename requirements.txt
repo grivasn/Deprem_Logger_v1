@@ -1,0 +1,8 @@
+requests
+python-dotenv
+matplotlib
+cartopy
+supabase
+python-telegram-bot==13.15
+numpy
+beautifulsoup4
